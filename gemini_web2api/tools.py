@@ -143,6 +143,75 @@ def parse_tool_calls(text: str) -> tuple:
     return clean, tool_calls
 
 
+_TOOL_CALL_MARKER = "```tool_call\n"
+_TOOL_CALL_END = "\n```"
+
+
+def _tool_marker_suffix_length(text: str) -> int:
+    """Return the longest suffix that could start a tool-call marker."""
+    max_len = min(len(text), len(_TOOL_CALL_MARKER) - 1)
+    for length in range(max_len, 0, -1):
+        if text.endswith(_TOOL_CALL_MARKER[:length]):
+            return length
+    return 0
+
+
+def iter_stream_events(deltas, allow_tool_calls: bool = True):
+    """Turn Gemini text deltas into ``content`` and ``tool_calls`` events."""
+    if not allow_tool_calls:
+        for delta in deltas:
+            if delta:
+                yield "content", delta
+        return
+
+    pending = ""
+    tool_body = None
+    for delta in deltas:
+        if not delta:
+            continue
+        pending += delta
+        while pending:
+            if tool_body is not None:
+                end_at = pending.find(_TOOL_CALL_END)
+                if end_at < 0:
+                    tool_body += pending
+                    pending = ""
+                    break
+                tool_body += pending[:end_at]
+                block = _TOOL_CALL_MARKER + tool_body + _TOOL_CALL_END
+                pending = pending[end_at + len(_TOOL_CALL_END):]
+                tool_body = None
+                _, calls = parse_tool_calls(block)
+                if calls:
+                    yield "tool_calls", [
+                        {"name": call["function"]["name"], "arguments": call["function"]["arguments"]}
+                        for call in calls
+                    ]
+                else:
+                    yield "content", block
+                continue
+
+            marker_at = pending.find(_TOOL_CALL_MARKER)
+            if marker_at >= 0:
+                if marker_at:
+                    yield "content", pending[:marker_at]
+                pending = pending[marker_at + len(_TOOL_CALL_MARKER):]
+                tool_body = ""
+                continue
+
+            suffix_length = _tool_marker_suffix_length(pending)
+            if len(pending) > suffix_length:
+                text = pending[:-suffix_length] if suffix_length else pending
+                pending = pending[-suffix_length:] if suffix_length else ""
+                yield "content", text
+            break
+
+    if tool_body is not None:
+        yield "content", _TOOL_CALL_MARKER + tool_body
+    elif pending:
+        yield "content", pending
+
+
 # ─── Google Native API helpers ─────────────────────────────────────────────────
 
 

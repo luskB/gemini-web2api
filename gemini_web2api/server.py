@@ -9,7 +9,10 @@ from socketserver import ThreadingMixIn
 from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
-from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
+from .tools import (
+    messages_to_prompt, parse_tool_calls, google_contents_to_prompt,
+    parse_google_function_calls, iter_stream_events,
+)
 from .multimodal import upload_image, fetch_image_bytes
 from . import __version__
 
@@ -18,6 +21,43 @@ def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
     c = len(text or "") // 4
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def build_openai_stream_chunks(events, completion_id: str, model_name: str, created: int = None):
+    """Build OpenAI chat-completion chunks from text and tool-call events."""
+    created = int(time.time()) if created is None else created
+    finish_reason = "stop"
+    tool_index = 0
+
+    for kind, value in events:
+        if kind == "content":
+            if not value:
+                continue
+            yield {
+                "id": completion_id, "object": "chat.completion.chunk", "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": value}, "finish_reason": None}],
+            }
+        elif kind == "tool_calls":
+            finish_reason = "tool_calls"
+            for call in value:
+                yield {
+                    "id": completion_id, "object": "chat.completion.chunk", "created": created,
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {"tool_calls": [{
+                        "index": tool_index,
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {"name": call["name"], "arguments": call["arguments"]},
+                    }]}, "finish_reason": None}],
+                }
+                tool_index += 1
+
+    yield {
+        "id": completion_id, "object": "chat.completion.chunk", "created": created,
+        "model": model_name,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+    }
 
 
 def _upload_images(images: list) -> list:
@@ -166,17 +206,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-        if stream and (not tools or tool_choice == "none"):
+        if stream:
             try:
                 self._start_sse()
-                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields):
-                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                             "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
+                events = iter_stream_events(
+                    generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields),
+                    allow_tool_calls=bool(tools) and tool_choice != "none",
+                )
+                for chunk in build_openai_stream_chunks(events, cid, model_name):
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
-                end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                       "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
@@ -197,21 +236,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             msg["tool_calls"] = tool_calls
         finish = "tool_calls" if tool_calls else "stop"
 
-        if stream:
-            self._start_sse()
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                     "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        else:
-            self.send_json({
-                "id": cid, "object": "chat.completion", "created": int(time.time()),
-                "model": model_name,
-                "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
-                          "total_tokens": (len(prompt)+len(text or ""))//4},
-            })
+        self.send_json({
+            "id": cid, "object": "chat.completion", "created": int(time.time()),
+            "model": model_name,
+            "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+            "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
+                      "total_tokens": (len(prompt)+len(text or ""))//4},
+        })
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
 

@@ -427,6 +427,109 @@ def parse_tool_calls(text: str) -> tuple:
     return clean, tool_calls
 
 
+_TOOL_CALL_MARKER = "```tool_call\n"
+_TOOL_CALL_END = "\n```"
+
+
+def _tool_marker_suffix_length(text: str) -> int:
+    max_len = min(len(text), len(_TOOL_CALL_MARKER) - 1)
+    for length in range(max_len, 0, -1):
+        if text.endswith(_TOOL_CALL_MARKER[:length]):
+            return length
+    return 0
+
+
+def iter_stream_events(deltas, allow_tool_calls: bool = True):
+    """Turn Gemini text deltas into content and structured tool-call events."""
+    if not allow_tool_calls:
+        for delta in deltas:
+            if delta:
+                yield "content", delta
+        return
+
+    pending = ""
+    tool_body = None
+    for delta in deltas:
+        if not delta:
+            continue
+        pending += delta
+        while pending:
+            if tool_body is not None:
+                end_at = pending.find(_TOOL_CALL_END)
+                if end_at < 0:
+                    tool_body += pending
+                    pending = ""
+                    break
+                tool_body += pending[:end_at]
+                block = _TOOL_CALL_MARKER + tool_body + _TOOL_CALL_END
+                pending = pending[end_at + len(_TOOL_CALL_END):]
+                tool_body = None
+                _, calls = parse_tool_calls(block)
+                if calls:
+                    yield "tool_calls", [
+                        {"name": call["function"]["name"], "arguments": call["function"]["arguments"]}
+                        for call in calls
+                    ]
+                else:
+                    yield "content", block
+                continue
+
+            marker_at = pending.find(_TOOL_CALL_MARKER)
+            if marker_at >= 0:
+                if marker_at:
+                    yield "content", pending[:marker_at]
+                pending = pending[marker_at + len(_TOOL_CALL_MARKER):]
+                tool_body = ""
+                continue
+
+            suffix_length = _tool_marker_suffix_length(pending)
+            if len(pending) > suffix_length:
+                text = pending[:-suffix_length] if suffix_length else pending
+                pending = pending[-suffix_length:] if suffix_length else ""
+                yield "content", text
+            break
+
+    if tool_body is not None:
+        yield "content", _TOOL_CALL_MARKER + tool_body
+    elif pending:
+        yield "content", pending
+
+
+def build_openai_stream_chunks(events, completion_id: str, model_name: str, created: int = None):
+    """Build OpenAI chat-completion chunks from content and tool-call events."""
+    created = int(time.time()) if created is None else created
+    finish_reason = "stop"
+    tool_index = 0
+    for kind, value in events:
+        if kind == "content":
+            if not value:
+                continue
+            yield {
+                "id": completion_id, "object": "chat.completion.chunk", "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": value}, "finish_reason": None}],
+            }
+        elif kind == "tool_calls":
+            finish_reason = "tool_calls"
+            for call in value:
+                yield {
+                    "id": completion_id, "object": "chat.completion.chunk", "created": created,
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {"tool_calls": [{
+                        "index": tool_index,
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {"name": call["name"], "arguments": call["arguments"]},
+                    }]}, "finish_reason": None}],
+                }
+                tool_index += 1
+    yield {
+        "id": completion_id, "object": "chat.completion.chunk", "created": created,
+        "model": model_name,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+    }
+
+
 # ─── HTTP Handler ────────────────────────────────────────────────────────────
 
 class GeminiHandler(BaseHTTPRequestHandler):
@@ -545,7 +648,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tools = req.get("tools")
-        prompt = messages_to_prompt(req.get("messages", []), tools)
+        tool_choice = req.get("tool_choice", "auto")
+        prompt = messages_to_prompt(
+            req.get("messages", []), tools if tool_choice != "none" else None,
+        )
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -553,23 +659,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
-        if stream and not tools:
-            # True streaming: forward chunks as they arrive
+        if stream:
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode):
-                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                             "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
+                events = iter_stream_events(
+                    gemini_stream_generate_iter(prompt, model_id, think_mode),
+                    allow_tool_calls=bool(tools) and tool_choice != "none",
+                )
+                for chunk in build_openai_stream_chunks(events, cid, model_name):
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
-                # Final chunk
-                chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                         "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
@@ -578,9 +681,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 log(f"Stream error: {e}")
             return
 
-        # Non-streaming (or tool calling which needs full response)
+        # Non-streaming requests need a complete response for tool parsing.
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
+            text, tool_calls = self._call_gemini(
+                prompt, model_id, think_mode, tools if tool_choice != "none" else None,
+            )
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -590,26 +695,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
             msg["tool_calls"] = tool_calls
         finish = "tool_calls" if tool_calls else "stop"
 
-        if stream:
-            # Stream mode with tools: send as single chunk (need full parse for tool_calls)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                     "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        else:
-            self.send_json({
-                "id": cid, "object": "chat.completion", "created": int(time.time()),
-                "model": model_name,
-                "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text)//4,
-                          "total_tokens": (len(prompt)+len(text))//4},
-            })
+        self.send_json({
+            "id": cid, "object": "chat.completion", "created": int(time.time()),
+            "model": model_name,
+            "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+            "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text)//4,
+                      "total_tokens": (len(prompt)+len(text))//4},
+        })
 
     def handle_responses(self, body: bytes):
         """OpenAI Responses API for Codex CLI compatibility."""
