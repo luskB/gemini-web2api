@@ -427,6 +427,25 @@ def parse_tool_calls(text: str) -> tuple:
     return clean, tool_calls
 
 
+def parse_google_function_calls(text: str) -> tuple:
+    """Extract Google native ``function_call`` blocks from model output."""
+    function_calls = []
+    pattern = r'```function_call\s*\n(.*?)\n```'
+    clean = text
+    for match in re.findall(pattern, clean, re.DOTALL):
+        try:
+            data = json.loads(match.strip())
+            if "name" in data:
+                function_calls.append({
+                    "name": data["name"],
+                    "args": data.get("args", data.get("arguments", {})),
+                })
+        except (json.JSONDecodeError, KeyError):
+            pass
+    clean = re.sub(pattern, '', clean, flags=re.DOTALL).strip()
+    return clean, function_calls
+
+
 _TOOL_CALL_MARKER = "```tool_call\n"
 _TOOL_CALL_END = "\n```"
 
@@ -495,6 +514,71 @@ def iter_stream_events(deltas, allow_tool_calls: bool = True):
         yield "content", pending
 
 
+_FUNCTION_CALL_MARKER = "```function_call\n"
+_FUNCTION_CALL_END = "\n```"
+
+
+def _function_marker_suffix_length(text: str) -> int:
+    max_len = min(len(text), len(_FUNCTION_CALL_MARKER) - 1)
+    for length in range(max_len, 0, -1):
+        if text.endswith(_FUNCTION_CALL_MARKER[:length]):
+            return length
+    return 0
+
+
+def iter_google_function_call_events(deltas, allow_function_calls: bool = True):
+    """Turn Gemini text deltas into Google-native content and function-call events."""
+    if not allow_function_calls:
+        for delta in deltas:
+            if delta:
+                yield "content", delta
+        return
+
+    pending = ""
+    function_body = None
+    for delta in deltas:
+        if not delta:
+            continue
+        pending += delta
+        while pending:
+            if function_body is not None:
+                end_at = pending.find(_FUNCTION_CALL_END)
+                if end_at < 0:
+                    function_body += pending
+                    pending = ""
+                    break
+                function_body += pending[:end_at]
+                block = _FUNCTION_CALL_MARKER + function_body + _FUNCTION_CALL_END
+                pending = pending[end_at + len(_FUNCTION_CALL_END):]
+                function_body = None
+                _, function_calls = parse_google_function_calls(block)
+                if function_calls:
+                    yield "function_calls", function_calls
+                else:
+                    yield "content", block
+                continue
+
+            marker_at = pending.find(_FUNCTION_CALL_MARKER)
+            if marker_at >= 0:
+                if marker_at:
+                    yield "content", pending[:marker_at]
+                pending = pending[marker_at + len(_FUNCTION_CALL_MARKER):]
+                function_body = ""
+                continue
+
+            suffix_length = _function_marker_suffix_length(pending)
+            if len(pending) > suffix_length:
+                text = pending[:-suffix_length] if suffix_length else pending
+                pending = pending[-suffix_length:] if suffix_length else ""
+                yield "content", text
+            break
+
+    if function_body is not None:
+        yield "content", _FUNCTION_CALL_MARKER + function_body
+    elif pending:
+        yield "content", pending
+
+
 def build_openai_stream_chunks(events, completion_id: str, model_name: str, created: int = None):
     """Build OpenAI chat-completion chunks from content and tool-call events."""
     created = int(time.time()) if created is None else created
@@ -527,6 +611,190 @@ def build_openai_stream_chunks(events, completion_id: str, model_name: str, crea
         "id": completion_id, "object": "chat.completion.chunk", "created": created,
         "model": model_name,
         "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+    }
+
+
+def build_responses_stream_events(events, response_id: str, model_name: str, prompt_tokens: int):
+    """Build Responses API SSE events from text and tool-call stream events."""
+    created_at = int(time.time())
+    output = []
+    active_message = None
+    active_message_index = None
+    active_part = None
+    output_tokens = 0
+
+    def response(status: str, include_output: bool = False):
+        value = {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": status,
+            "model": model_name,
+            "output": output if include_output else [],
+        }
+        if status == "completed":
+            value["usage"] = {
+                "input_tokens": prompt_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": prompt_tokens + output_tokens,
+            }
+        return value
+
+    def close_message():
+        nonlocal active_message, active_message_index, active_part
+        if active_message is None:
+            return
+        yield "response.output_text.done", {
+            "type": "response.output_text.done",
+            "item_id": active_message["id"],
+            "output_index": active_message_index,
+            "content_index": 0,
+            "text": active_part["text"],
+        }
+        yield "response.content_part.done", {
+            "type": "response.content_part.done",
+            "item_id": active_message["id"],
+            "output_index": active_message_index,
+            "content_index": 0,
+            "part": active_part,
+        }
+        active_message["status"] = "completed"
+        yield "response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": active_message_index,
+            "item": active_message,
+        }
+        active_message = None
+        active_message_index = None
+        active_part = None
+
+    yield "response.created", {"type": "response.created", "response": response("in_progress")}
+    yield "response.in_progress", {"type": "response.in_progress", "response": response("in_progress")}
+
+    for kind, value in events:
+        if kind == "content":
+            if not value:
+                continue
+            if active_message is None:
+                active_message_index = len(output)
+                active_message = {
+                    "id": f"msg_{uuid.uuid4().hex[:12]}",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                }
+                output.append(active_message)
+                yield "response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": active_message_index,
+                    "item": active_message,
+                }
+                active_part = {"type": "output_text", "text": "", "annotations": []}
+                active_message["content"].append(active_part)
+                yield "response.content_part.added", {
+                    "type": "response.content_part.added",
+                    "item_id": active_message["id"],
+                    "output_index": active_message_index,
+                    "content_index": 0,
+                    "part": active_part,
+                }
+            active_part["text"] += value
+            output_tokens += len(value) // 4
+            yield "response.output_text.delta", {
+                "type": "response.output_text.delta",
+                "item_id": active_message["id"],
+                "output_index": active_message_index,
+                "content_index": 0,
+                "delta": value,
+            }
+        elif kind == "tool_calls":
+            yield from close_message()
+            for call in value:
+                output_index = len(output)
+                item = {
+                    "id": f"fc_{uuid.uuid4().hex[:12]}",
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": f"call_{uuid.uuid4().hex[:8]}",
+                    "name": call["name"],
+                    "arguments": "",
+                }
+                output.append(item)
+                yield "response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": item,
+                }
+                arguments = call["arguments"]
+                item["arguments"] = arguments
+                output_tokens += len(arguments) // 4
+                yield "response.function_call_arguments.delta", {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "delta": arguments,
+                }
+                yield "response.function_call_arguments.done", {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "arguments": arguments,
+                }
+                item["status"] = "completed"
+                yield "response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                }
+
+    yield from close_message()
+    yield "response.completed", {
+        "type": "response.completed",
+        "response": response("completed", include_output=True),
+    }
+
+
+def build_google_stream_chunks(events, model_name: str, prompt_tokens: int):
+    """Build Google native streaming chunks from text and function-call events."""
+    output_characters = 0
+    for kind, value in events:
+        if kind == "content":
+            if not value:
+                continue
+            output_characters += len(value)
+            yield {
+                "candidates": [{
+                    "content": {"parts": [{"text": value}], "role": "model"},
+                    "index": 0,
+                }],
+                "modelVersion": model_name,
+            }
+        elif kind == "function_calls":
+            for function_call in value:
+                output_characters += len(json.dumps(function_call, ensure_ascii=False))
+                yield {
+                    "candidates": [{
+                        "content": {
+                            "parts": [{"functionCall": {
+                                "name": function_call["name"],
+                                "args": function_call["args"],
+                            }}],
+                            "role": "model",
+                        },
+                        "index": 0,
+                    }],
+                    "modelVersion": model_name,
+                }
+
+    yield {
+        "candidates": [{"finishReason": "STOP", "index": 0}],
+        "usageMetadata": {
+            "promptTokenCount": prompt_tokens,
+            "candidatesTokenCount": output_characters // 4,
+            "totalTokenCount": prompt_tokens + output_characters // 4,
+        },
+        "modelVersion": model_name,
     }
 
 
@@ -714,6 +982,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         input_items = req.get("input", [])
         tools = req.get("tools")
+        tool_choice = req.get("tool_choice", "auto")
 
         messages = []
         if req.get("instructions"):
@@ -755,13 +1024,37 @@ class GeminiHandler(BaseHTTPRequestHandler):
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
 
-        prompt = messages_to_prompt(messages, tools)
+        prompt = messages_to_prompt(messages, tools if tool_choice != "none" else None)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        if req.get("stream"):
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                events = iter_stream_events(
+                    gemini_stream_generate_iter(prompt, model_id, think_mode),
+                    allow_tool_calls=bool(tools) and tool_choice != "none",
+                )
+                for event_name, payload in build_responses_stream_events(
+                    events, f"resp_{uuid.uuid4().hex[:16]}", model_name, len(prompt) // 4,
+                ):
+                    self.wfile.write(
+                        f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
+            text, tool_calls = self._call_gemini(
+                prompt, model_id, think_mode, tools if tool_choice != "none" else None,
+            )
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -777,30 +1070,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
 
-        if req.get("stream"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
-            self.wfile.write(f"event: response.created\ndata: {json.dumps(ev)}\n\n".encode())
-            for item in output:
-                if item["type"] == "function_call":
-                    ev = {"type": "response.function_call_arguments.done", "item_id": item["id"], "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}
-                    self.wfile.write(f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n".encode())
-                elif item["type"] == "message":
-                    for ci, cp in enumerate(item["content"]):
-                        ev = {"type": "response.output_text.done", "item_id": item["id"], "content_index": ci, "text": cp["text"]}
-                        self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
-            resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
-                        "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}}
-            self.wfile.write(f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n".encode())
-            self.wfile.flush()
-        else:
-            self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
-                            "model": model_name, "output": output,
-                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}})
+        self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
+                        "model": model_name, "output": output,
+                        "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text)//4, "total_tokens": (len(prompt)+len(text))//4}})
 
 
     # ─── Google Native API (Gemini CLI compatible) ────────────────────────────
@@ -827,6 +1099,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def _google_contents_to_prompt(self, req: dict) -> str:
         """Convert Google API contents format to prompt string."""
         parts = []
+        tool_defs = []
+        for tool in req.get("tools", []):
+            for function in tool.get("functionDeclarations", []):
+                tool_defs.append({
+                    "name": function.get("name", ""),
+                    "description": function.get("description", ""),
+                    "parameters": function.get("parameters", {}),
+                })
         sys_inst = req.get("systemInstruction")
         if sys_inst:
             sys_parts = sys_inst.get("parts", [])
@@ -834,12 +1114,39 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if sys_text:
                 parts.append(f"[System instruction]: {sys_text}")
 
+        if tool_defs:
+            fc_config = req.get("toolConfig", {}).get("functionCallingConfig", {})
+            mode = fc_config.get("mode", "AUTO")
+            constraint = ""
+            if mode == "NONE":
+                constraint = "\nDo not call tools; respond with text only."
+            elif mode == "ANY":
+                allowed = fc_config.get("allowedFunctionNames", [])
+                names = ", ".join(allowed)
+                constraint = f"\nYou must call{' one of: ' + names if names else ' at least one tool'}; do not respond with text only."
+            parts.append(
+                "[System instruction]: You can call tools. Use exactly:\n"
+                '```function_call\n{"name": "function_name", "args": {...}}\n```\n'
+                "When calling a tool, output only the function_call block.\n\n"
+                f"Available tools:\n{json.dumps(tool_defs, ensure_ascii=False, indent=2)}{constraint}"
+            )
+
         for content in req.get("contents", []):
             role = content.get("role", "user")
             text_parts = []
             for p in content.get("parts", []):
                 if p.get("text"):
                     text_parts.append(p["text"])
+                elif p.get("functionCall"):
+                    fc = p["functionCall"]
+                    text_parts.append(
+                        f'```function_call\n{json.dumps({"name": fc.get("name", ""), "args": fc.get("args", {})}, ensure_ascii=False)}\n```'
+                    )
+                elif p.get("functionResponse"):
+                    fr = p["functionResponse"]
+                    text_parts.append(
+                        f'[Tool result for {fr.get("name", "")}]: {json.dumps(fr.get("response", {}), ensure_ascii=False)}'
+                    )
             text = " ".join(text_parts)
             if role == "model":
                 parts.append(f"[Assistant]: {text}")
@@ -860,26 +1167,63 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": err}}, 400)
             return
 
+        tool_config = req.get("toolConfig", {})
+        fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
+        has_tools = bool(req.get("tools")) and fc_mode != "NONE"
         prompt = self._google_contents_to_prompt(req)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
 
+        if stream:
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                events = iter_google_function_call_events(
+                    gemini_stream_generate_iter(prompt, model_id, think_mode),
+                    allow_function_calls=has_tools,
+                )
+                for chunk in build_google_stream_chunks(events, model_name, len(prompt) // 4):
+                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
         try:
-            text, _ = self._call_gemini(prompt, model_id, think_mode, None)
+            raw = gemini_stream_generate(prompt, model_id, think_mode)
+            text = extract_response_text(raw)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
+        response_parts = []
+        if has_tools and text:
+            clean_text, function_calls = parse_google_function_calls(text)
+            if function_calls:
+                if clean_text:
+                    response_parts.append({"text": clean_text})
+                response_parts.extend(
+                    {"functionCall": {"name": call["name"], "args": call["args"]}}
+                    for call in function_calls
+                )
+            else:
+                response_parts.append({"text": text})
+        else:
+            response_parts.append({"text": text or ""})
+
         candidate = {
-            "content": {"parts": [{"text": text or ""}], "role": "model"},
+            "content": {"parts": response_parts, "role": "model"},
             "finishReason": "STOP",
             "index": 0,
         }
         usage = {
             "promptTokenCount": len(prompt) // 4,
-            "candidatesTokenCount": len(text) // 4,
-            "totalTokenCount": (len(prompt) + len(text)) // 4,
+            "candidatesTokenCount": len(text or "") // 4,
+            "totalTokenCount": (len(prompt) + len(text or "")) // 4,
         }
         response_obj = {
             "candidates": [candidate],
@@ -887,16 +1231,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             "modelVersion": model_name,
         }
 
-        if stream:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(f"data: {json.dumps(response_obj)}\n\n".encode())
-            self.wfile.flush()
-        else:
-            self.send_json(response_obj)
+        self.send_json(response_obj)
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────

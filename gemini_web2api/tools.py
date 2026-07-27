@@ -354,3 +354,69 @@ def parse_google_function_calls(text: str) -> tuple:
         except (json.JSONDecodeError, KeyError):
             pass
     return clean, function_calls
+
+
+_FUNCTION_CALL_MARKER = "```function_call\n"
+_FUNCTION_CALL_END = "\n```"
+
+
+def _function_marker_suffix_length(text: str) -> int:
+    """Return the longest suffix that could start a Google function-call marker."""
+    max_len = min(len(text), len(_FUNCTION_CALL_MARKER) - 1)
+    for length in range(max_len, 0, -1):
+        if text.endswith(_FUNCTION_CALL_MARKER[:length]):
+            return length
+    return 0
+
+
+def iter_google_function_call_events(deltas, allow_function_calls: bool = True):
+    """Turn Gemini text deltas into Google-native content and function-call events."""
+    if not allow_function_calls:
+        for delta in deltas:
+            if delta:
+                yield "content", delta
+        return
+
+    pending = ""
+    function_body = None
+    for delta in deltas:
+        if not delta:
+            continue
+        pending += delta
+        while pending:
+            if function_body is not None:
+                end_at = pending.find(_FUNCTION_CALL_END)
+                if end_at < 0:
+                    function_body += pending
+                    pending = ""
+                    break
+                function_body += pending[:end_at]
+                block = _FUNCTION_CALL_MARKER + function_body + _FUNCTION_CALL_END
+                pending = pending[end_at + len(_FUNCTION_CALL_END):]
+                function_body = None
+                _, function_calls = parse_google_function_calls(block)
+                if function_calls:
+                    yield "function_calls", function_calls
+                else:
+                    yield "content", block
+                continue
+
+            marker_at = pending.find(_FUNCTION_CALL_MARKER)
+            if marker_at >= 0:
+                if marker_at:
+                    yield "content", pending[:marker_at]
+                pending = pending[marker_at + len(_FUNCTION_CALL_MARKER):]
+                function_body = ""
+                continue
+
+            suffix_length = _function_marker_suffix_length(pending)
+            if len(pending) > suffix_length:
+                text = pending[:-suffix_length] if suffix_length else pending
+                pending = pending[-suffix_length:] if suffix_length else ""
+                yield "content", text
+            break
+
+    if function_body is not None:
+        yield "content", _FUNCTION_CALL_MARKER + function_body
+    elif pending:
+        yield "content", pending

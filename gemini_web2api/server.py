@@ -11,7 +11,7 @@ from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
 from .tools import (
     messages_to_prompt, parse_tool_calls, google_contents_to_prompt,
-    parse_google_function_calls, iter_stream_events,
+    parse_google_function_calls, iter_stream_events, iter_google_function_call_events,
 )
 from .multimodal import upload_image, fetch_image_bytes
 from . import __version__
@@ -57,6 +57,191 @@ def build_openai_stream_chunks(events, completion_id: str, model_name: str, crea
         "id": completion_id, "object": "chat.completion.chunk", "created": created,
         "model": model_name,
         "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+    }
+
+
+def build_responses_stream_events(events, response_id: str, model_name: str, prompt_tokens: int):
+    """Build Responses API SSE events from text and tool-call stream events."""
+    created_at = int(time.time())
+    output = []
+    active_message = None
+    active_message_index = None
+    active_part = None
+    output_tokens = 0
+
+    def response(status: str, include_output: bool = False):
+        value = {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": status,
+            "model": model_name,
+            "output": output if include_output else [],
+        }
+        if status == "completed":
+            value["usage"] = {
+                "input_tokens": prompt_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": prompt_tokens + output_tokens,
+            }
+        return value
+
+    def close_message():
+        nonlocal active_message, active_message_index, active_part
+        if active_message is None:
+            return
+        yield "response.output_text.done", {
+            "type": "response.output_text.done",
+            "item_id": active_message["id"],
+            "output_index": active_message_index,
+            "content_index": 0,
+            "text": active_part["text"],
+        }
+        yield "response.content_part.done", {
+            "type": "response.content_part.done",
+            "item_id": active_message["id"],
+            "output_index": active_message_index,
+            "content_index": 0,
+            "part": active_part,
+        }
+        active_message["status"] = "completed"
+        yield "response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": active_message_index,
+            "item": active_message,
+        }
+        active_message = None
+        active_message_index = None
+        active_part = None
+
+    yield "response.created", {"type": "response.created", "response": response("in_progress")}
+    yield "response.in_progress", {"type": "response.in_progress", "response": response("in_progress")}
+
+    for kind, value in events:
+        if kind == "content":
+            if not value:
+                continue
+            if active_message is None:
+                active_message_index = len(output)
+                active_message = {
+                    "id": f"msg_{uuid.uuid4().hex[:12]}",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                }
+                output.append(active_message)
+                yield "response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": active_message_index,
+                    "item": active_message,
+                }
+                active_part = {"type": "output_text", "text": "", "annotations": []}
+                active_message["content"].append(active_part)
+                yield "response.content_part.added", {
+                    "type": "response.content_part.added",
+                    "item_id": active_message["id"],
+                    "output_index": active_message_index,
+                    "content_index": 0,
+                    "part": active_part,
+                }
+            active_part["text"] += value
+            output_tokens += len(value) // 4
+            yield "response.output_text.delta", {
+                "type": "response.output_text.delta",
+                "item_id": active_message["id"],
+                "output_index": active_message_index,
+                "content_index": 0,
+                "delta": value,
+            }
+        elif kind == "tool_calls":
+            yield from close_message()
+            for call in value:
+                output_index = len(output)
+                call_id = f"call_{uuid.uuid4().hex[:8]}"
+                item = {
+                    "id": f"fc_{uuid.uuid4().hex[:12]}",
+                    "type": "function_call",
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "name": call["name"],
+                    "arguments": "",
+                }
+                output.append(item)
+                yield "response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": item,
+                }
+                arguments = call["arguments"]
+                item["arguments"] = arguments
+                output_tokens += len(arguments) // 4
+                yield "response.function_call_arguments.delta", {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "delta": arguments,
+                }
+                yield "response.function_call_arguments.done", {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": item["id"],
+                    "output_index": output_index,
+                    "arguments": arguments,
+                }
+                item["status"] = "completed"
+                yield "response.output_item.done", {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": item,
+                }
+
+    yield from close_message()
+    yield "response.completed", {
+        "type": "response.completed",
+        "response": response("completed", include_output=True),
+    }
+
+
+def build_google_stream_chunks(events, model_name: str, prompt_tokens: int):
+    """Build Google native streaming chunks from text and function-call events."""
+    output_characters = 0
+    for kind, value in events:
+        if kind == "content":
+            if not value:
+                continue
+            output_characters += len(value)
+            yield {
+                "candidates": [{
+                    "content": {"parts": [{"text": value}], "role": "model"},
+                    "index": 0,
+                }],
+                "modelVersion": model_name,
+            }
+        elif kind == "function_calls":
+            for function_call in value:
+                output_characters += len(json.dumps(function_call, ensure_ascii=False))
+                yield {
+                    "candidates": [{
+                        "content": {
+                            "parts": [{"functionCall": {
+                                "name": function_call["name"],
+                                "args": function_call["args"],
+                            }}],
+                            "role": "model",
+                        },
+                        "index": 0,
+                    }],
+                    "modelVersion": model_name,
+                }
+
+    yield {
+        "candidates": [{"finishReason": "STOP", "index": 0}],
+        "usageMetadata": {
+            "promptTokenCount": prompt_tokens,
+            "candidatesTokenCount": output_characters // 4,
+            "totalTokenCount": prompt_tokens + output_characters // 4,
+        },
+        "modelVersion": model_name,
     }
 
 
@@ -305,6 +490,25 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        if req.get("stream"):
+            try:
+                self._start_sse()
+                response_id = f"resp_{uuid.uuid4().hex[:16]}"
+                events = iter_stream_events(
+                    generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields),
+                    allow_tool_calls=bool(tools) and tool_choice != "none",
+                )
+                for event_name, payload in build_responses_stream_events(
+                    events, response_id, model_name, len(prompt) // 4,
+                ):
+                    self.wfile.write(
+                        f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
         try:
             text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
         except Exception as e:
@@ -326,30 +530,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
                            "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
 
-        if req.get("stream"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            ev = {"type": "response.created", "response": {"id": rid, "object": "response", "status": "in_progress", "model": model_name, "output": []}}
-            self.wfile.write(f"event: response.created\ndata: {json.dumps(ev)}\n\n".encode())
-            for item in output:
-                if item["type"] == "function_call":
-                    ev = {"type": "response.function_call_arguments.done", "item_id": item["id"], "call_id": item["call_id"], "name": item["name"], "arguments": item["arguments"]}
-                    self.wfile.write(f"event: response.function_call_arguments.done\ndata: {json.dumps(ev)}\n\n".encode())
-                elif item["type"] == "message":
-                    for ci, cp in enumerate(item["content"]):
-                        ev = {"type": "response.output_text.done", "item_id": item["id"], "content_index": ci, "text": cp["text"]}
-                        self.wfile.write(f"event: response.output_text.done\ndata: {json.dumps(ev)}\n\n".encode())
-            resp_obj = {"id": rid, "object": "response", "status": "completed", "model": model_name, "output": output,
-                        "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}}
-            self.wfile.write(f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_obj})}\n\n".encode())
-            self.wfile.flush()
-        else:
-            self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
-                            "model": model_name, "output": output,
-                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}})
+        self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
+                        "model": model_name, "output": output,
+                        "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}})
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 
@@ -376,31 +559,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
         file_refs = _upload_images(images)
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
 
-        if stream and not has_tools:
+        if stream:
             try:
                 self._start_sse()
-                full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
-                    if not delta:
-                        continue
-                    full_text += delta
-                    chunk_obj = {
-                        "candidates": [{"content": {"parts": [{"text": delta}], "role": "model"}, "index": 0}],
-                        "modelVersion": model_name,
-                    }
+                events = iter_google_function_call_events(
+                    generate_stream(prompt, model_id, think_mode, file_refs, extra_fields),
+                    allow_function_calls=has_tools,
+                )
+                for chunk_obj in build_google_stream_chunks(events, model_name, len(prompt) // 4):
                     self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
-                final_chunk = {
-                    "candidates": [{"finishReason": "STOP", "index": 0}],
-                    "usageMetadata": {
-                        "promptTokenCount": len(prompt) // 4,
-                        "candidatesTokenCount": len(full_text) // 4,
-                        "totalTokenCount": (len(prompt) + len(full_text)) // 4,
-                    },
-                    "modelVersion": model_name,
-                }
-                self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
-                self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             return
